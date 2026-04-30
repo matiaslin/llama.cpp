@@ -29,21 +29,25 @@ __device__ __forceinline__ float block_reduce_sum_full(float val, float * __rest
     return smem[0];  // this will be identical in every thread
 }
 
-__global__ void paged_attention_write_kernel(const float * __restrict__ k_new,  // [batch_size, n_heads_kv, head_dim]
-                                             const float * __restrict__ v_new,  // [batch_size, n_heads_kv, head_dim]
-                                             half * __restrict__ kv_cache,      // The paged cache
-                                             const int * __restrict__ write_slots,  // Global slot index for each token
-                                             const int * __restrict__ batch_offsets,
-                                             const int * __restrict__ batch_lens,
-                                             const size_t stride_token,  // Elements between tokens in a block (nb1)
-                                             const size_t stride_head,   // Elements between heads (nb2)
-                                             const size_t stride_block,  // Elements between physical blocks (nb3)
-                                             const int    n_heads_kv,
-                                             const int    block_size) {
+__global__ void paged_attention_write_kernel(
+    const float * __restrict__ k_new,      // [head_dim, n_heads_kv, batch_size]
+    const float * __restrict__ v_new,      // [head_dim, n_heads_kv, batch_size]
+    half * __restrict__ kv_cache,          // The paged cache
+    const int * __restrict__ write_slots,  // Global slot index for each token
+    const int * __restrict__ batch_offsets,
+    const int * __restrict__ batch_lens,
+    const size_t cache_stride_token,    // KV cache: elements between tokens in a block
+    const size_t cache_stride_head,     // KV cache: elements between heads
+    const size_t cache_stride_block,    // KV cache: elements between physical blocks
+    const size_t k_input_stride_token,  // K input: elements between tokens (nb[2]/sizeof)
+    const size_t k_input_stride_head,   // K input: elements between heads (nb[1]/sizeof)
+    const size_t v_input_stride_token,  // V input: same concept as K
+    const size_t v_input_stride_head,   // V input: same concept as K
+    const int    n_heads_kv,
+    const int    block_size) {
     const int head_idx = blockIdx.x;   // 0 to n_heads_kv - 1
     const int seq_idx  = blockIdx.y;
     const int tid      = threadIdx.x;  // 0 to head_dim - 1
-    const int head_dim = blockDim.x;
 
     const int seq_start  = batch_offsets[seq_idx];
     const int num_tokens = batch_lens[seq_idx];
@@ -57,16 +61,20 @@ __global__ void paged_attention_write_kernel(const float * __restrict__ k_new,  
         const int token_in_block = target_slot % block_size;
 
         // K is at head_idx, V is at n_heads_kv + head_idx
-        const size_t k_cache_idx = (size_t) block_id * stride_block + (size_t) head_idx * stride_head +
-                                   (size_t) token_in_block * stride_token + tid;
-        const size_t v_cache_idx = (size_t) block_id * stride_block + (size_t) (n_heads_kv + head_idx) * stride_head +
-                                   (size_t) token_in_block * stride_token + tid;
+        const size_t k_cache_idx = (size_t) block_id * cache_stride_block + (size_t) head_idx * cache_stride_head +
+                                   (size_t) token_in_block * cache_stride_token + tid;
+        const size_t v_cache_idx = (size_t) block_id * cache_stride_block +
+                                   (size_t) (n_heads_kv + head_idx) * cache_stride_head +
+                                   (size_t) token_in_block * cache_stride_token + tid;
 
-        // Input offset: [token][head][dim]
-        const size_t input_off = (size_t) token_batch_idx * n_heads_kv * head_dim + (size_t) head_idx * head_dim + tid;
+        // Input offsets honor strides so views into a fused QKV tensor work without ggml_cont.
+        const size_t k_input_off =
+            (size_t) token_batch_idx * k_input_stride_token + (size_t) head_idx * k_input_stride_head + tid;
+        const size_t v_input_off =
+            (size_t) token_batch_idx * v_input_stride_token + (size_t) head_idx * v_input_stride_head + tid;
 
-        kv_cache[k_cache_idx] = __float2half(k_new[input_off]);
-        kv_cache[v_cache_idx] = __float2half(v_new[input_off]);
+        kv_cache[k_cache_idx] = __float2half(k_new[k_input_off]);
+        kv_cache[v_cache_idx] = __float2half(v_new[v_input_off]);
     }
 }
 
@@ -76,9 +84,11 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
                                               const int * __restrict__ context_lens,
                                               const int * __restrict__ batch_offsets,
                                               const int * __restrict__ batch_lens,
-                                              const size_t stride_token,
-                                              const size_t stride_head,
-                                              const size_t stride_block,
+                                              const size_t cache_stride_token,
+                                              const size_t cache_stride_head,
+                                              const size_t cache_stride_block,
+                                              const size_t q_input_stride_token,
+                                              const size_t q_input_stride_head,
                                               const int    n_heads_kv,
                                               const int    block_size,
                                               const int    max_blocks,
@@ -101,7 +111,9 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
     for (int i = 0; i < num_new_tokens; i++) {
         const int token_batch_idx = seq_start + i;
 
-        float q_val = q[(size_t) token_batch_idx * n_heads * head_dim + (size_t) head_idx * head_dim + tid] * scale;
+        const size_t q_off =
+            (size_t) token_batch_idx * q_input_stride_token + (size_t) head_idx * q_input_stride_head + tid;
+        float q_val = q[q_off] * scale;
 
         float qk_max  = -FLT_MAX;
         float exp_sum = 0.0f;
@@ -119,11 +131,12 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
             for (int token = start_token; token < end_token; ++token) {
                 const int token_in_block = token % block_size;
 
-                const size_t k_idx =
-                    tid + token_in_block * stride_token + kv_head_idx * stride_head + physical_block * stride_block;
+                const size_t k_idx = tid + token_in_block * cache_stride_token + kv_head_idx * cache_stride_head +
+                                     physical_block * cache_stride_block;
 
-                const size_t v_idx = tid + token_in_block * stride_token + (n_heads_kv + kv_head_idx) * stride_head +
-                                     physical_block * stride_block;
+                const size_t v_idx = tid + token_in_block * cache_stride_token +
+                                     (n_heads_kv + kv_head_idx) * cache_stride_head +
+                                     physical_block * cache_stride_block;
 
                 float k_val = __half2float(kv_cache[k_idx]);
                 float v_val = __half2float(kv_cache[v_idx]);
@@ -175,9 +188,17 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     GGML_ASSERT(n_heads % n_heads_kv == 0 && "n_heads must be divisible by n_heads_kv");
 
     // Extracting strides
-    const size_t stride_token = kv_cache->nb[1] / sizeof(half);
-    const size_t stride_head  = kv_cache->nb[2] / sizeof(half);
-    const size_t stride_block = kv_cache->nb[3] / sizeof(half);
+    const size_t cache_stride_token = kv_cache->nb[1] / sizeof(half);
+    const size_t cache_stride_head  = kv_cache->nb[2] / sizeof(half);
+    const size_t cache_stride_block = kv_cache->nb[3] / sizeof(half);
+
+    // Input strides honor source layout
+    const size_t q_input_stride_token = q->nb[2] / sizeof(float);
+    const size_t q_input_stride_head  = q->nb[1] / sizeof(float);
+    const size_t k_input_stride_token = k_new->nb[2] / sizeof(float);
+    const size_t k_input_stride_head  = k_new->nb[1] / sizeof(float);
+    const size_t v_input_stride_token = v_new->nb[2] / sizeof(float);
+    const size_t v_input_stride_head  = v_new->nb[1] / sizeof(float);
 
     dim3 block_dims(head_dim);       // one thread per dimension of head
     dim3 grid_dims(n_heads, n_seq);  // one block per head per sequence
@@ -186,7 +207,8 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     paged_attention_write_kernel<<<dim3(n_heads_kv, n_seq), dim3(head_dim), 0, ctx.stream()>>>(
         (const float *) k_new->data, (const float *) v_new->data, (half *) kv_cache->data,
         (const int *) write_slots->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
-        stride_token, stride_head, stride_block, n_heads_kv, block_size);
+        cache_stride_token, cache_stride_head, cache_stride_block, k_input_stride_token, k_input_stride_head,
+        v_input_stride_token, v_input_stride_head, n_heads_kv, block_size);
 
     // Shared memory
     const size_t n_warps    = ((size_t) head_dim + 31) / 32;
@@ -204,5 +226,6 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     paged_attention_decode_kernel<<<dim3(n_heads, n_seq), dim3(head_dim), smem_bytes, ctx.stream()>>>(
         (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
         (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
-        stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale, (float *) dst->data);
+        cache_stride_token, cache_stride_head, cache_stride_block, q_input_stride_token, q_input_stride_head,
+        n_heads_kv, block_size, max_blocks, scale, (float *) dst->data);
 }

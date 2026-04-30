@@ -22,7 +22,9 @@ llama_kv_cache_paged::llama_kv_cache_paged(uint32_t head_dim,
     num_gpu_blocks(0),
     num_cpu_blocks(0),
     gpu_backend(nullptr),
-    cpu_backend(nullptr) {}
+    cpu_backend(nullptr) {
+    GGML_ASSERT(block_size > 0 && "block_size must be greater than 0.");
+}
 
 void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
                                 ggml_backend_t backend_cpu,
@@ -103,12 +105,11 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     block_manager.init(n_gpu_blocks, n_cpu_blocks, watermark);
 }
 
-bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & group) {
+bool llama_kv_cache_paged::allocate(uint32_t num_tokens, llama_sequence_group & group) {
     uint32_t curr_block_count     = group.block_table.size();
-    uint32_t total_num_tokens     = group.n_prompt + group.n_decoded + num_tokens;
-    uint32_t num_requested_blocks = std::ceil((float) total_num_tokens / block_size) - curr_block_count;
-    LLAMA_LOG_DEBUG("%s: curr_block_count=%d, total_num_tokens=%d, num_requested_blocks=%d\n", __func__,
-                    curr_block_count, total_num_tokens, num_requested_blocks);
+    uint32_t num_requested_blocks = std::ceil((float) num_tokens / block_size) - curr_block_count;
+    LLAMA_LOG_DEBUG("%s: curr_block_count=%d, num_tokens=%d, num_requested_blocks=%d\n", __func__, curr_block_count,
+                    num_tokens, num_requested_blocks);
 
     if (num_requested_blocks == 0) {
         return true;
@@ -194,6 +195,34 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
     }
 }
 
+void llama_kv_cache_paged::do_block_copy_gpu_to_gpu(uint32_t src_bid, uint32_t dst_bid) {
+    GGML_ASSERT(src_bid != dst_bid && "cannot copy self.");
+    GGML_ASSERT(block_manager.is_gpu(src_bid) && "src_bid is not GPU");
+    GGML_ASSERT(block_manager.is_gpu(dst_bid) && "dst_bid is not GPU");
+
+    struct ggml_init_params params = {};
+    params.mem_size                = ggml_tensor_overhead() * 2 * n_layers;
+    params.mem_buffer              = nullptr;
+    params.no_alloc                = true;
+    struct ggml_context * ctx      = ggml_init(params);
+
+    const int64_t block_elems = (int64_t) (block_bytes / ggml_type_size(kv_type));
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        ggml_tensor * layer   = kv_gpu_layers[il];
+        const size_t  src_off = (size_t) src_bid * block_bytes;
+        const size_t  dst_off = (size_t) dst_bid * block_bytes;
+
+        ggml_tensor * src_view = ggml_view_1d(ctx, layer, block_elems, src_off);
+        ggml_tensor * dst_view = ggml_view_1d(ctx, layer, block_elems, dst_off);
+
+        ggml_backend_view_init(src_view);
+        ggml_backend_view_init(dst_view);
+
+        ggml_backend_tensor_copy(src_view, dst_view);
+    }
+    ggml_free(ctx);
+}
+
 bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
     const uint32_t num_blocks = group.block_table.size();
     if (num_blocks == 0) {
@@ -232,6 +261,50 @@ bool llama_kv_cache_paged::swap_out(llama_sequence_group & group) {
     return true;
 }
 
+bool llama_kv_cache_paged::try_cow_shared_blocks(llama_sequence_group & group,
+                                                 int32_t                write_start_pos,
+                                                 int32_t                n_write_tokens) {
+    const int32_t first_bt_idx = write_start_pos / (int32_t) block_size;
+    const int32_t last_bt_idx  = (write_start_pos + n_write_tokens - 1) / (int32_t) block_size;
+
+    // Collecting shared blocks
+    std::vector<int32_t> shared_bt_indices;
+    for (int32_t bt_idx = first_bt_idx; bt_idx <= last_bt_idx; ++bt_idx) {
+        GGML_ASSERT((size_t) bt_idx < group.block_table.size());
+
+        const uint32_t bid = group.block_table[bt_idx];
+        if (block_manager.get_ref_count(bid) > 1) {
+            shared_bt_indices.push_back(bt_idx);
+        }
+    }
+
+    const uint32_t shared_bts = shared_bt_indices.size();
+
+    if (shared_bts == 0) {
+        return true;
+    }
+
+    if (!block_manager.has_free_gpu_blocks(shared_bts)) {
+        return false;
+    }
+
+    for (int32_t bt_idx : shared_bt_indices) {
+        auto new_ids = block_manager.checkout_gpu_blocks(1);
+        GGML_ASSERT(!new_ids.empty() && "no free GPU blocks to checkout.");
+
+        const uint32_t old_bid = group.block_table[bt_idx];
+        do_block_copy_gpu_to_gpu(old_bid, new_ids[0]);
+
+        block_manager.release_gpu_blocks({ old_bid });
+        group.block_table[bt_idx] = new_ids[0];
+    }
+    return true;
+}
+
+void llama_kv_cache_paged::set_sequence_group_lookup(llama_sequence_group_cb cb) {
+    sequence_group_lookup = cb;
+}
+
 void llama_kv_cache_paged::set_paged_batch_info(const llama_paged_batch_info * info) {
     last_paged_info = info;
 }
@@ -243,6 +316,79 @@ uint32_t llama_kv_cache_paged::get_num_gpu_blocks() const {
 void llama_kv_cache_paged::concat_block_ids(llama_block_ids &       to_block_table,
                                             const llama_block_ids & from_block_table) {
     to_block_table.insert(to_block_table.end(), from_block_table.begin(), from_block_table.end());
+}
+
+void llama_kv_cache_paged::register_prompt_blocks(const llama_sequence_group & group) {
+    if (group.n_prompt < block_size) {
+        return;
+    }
+    GGML_ASSERT(group.logical_seq.size() >= group.n_prompt && "logical_seq must contain at least n_prompt tokens.");
+    const std::vector<llama_token> prompt_tokens(group.logical_seq.begin(), group.logical_seq.begin() + group.n_prompt);
+
+    auto hashes = compute_prompt_block_hashes(prompt_tokens, block_size);
+    GGML_ASSERT(hashes.size() <= group.block_table.size() && "more hashes than blocks in block_table.");
+
+    for (size_t bid = 0; bid < hashes.size(); ++bid) {
+        std::vector<llama_token> block_tokens(prompt_tokens.begin() + bid * block_size,
+                                              prompt_tokens.begin() + (bid + 1) * block_size);
+        block_manager.register_block_hash(group.block_table[bid], hashes[bid], std::move(block_tokens));
+    }
+}
+
+std::vector<uint32_t> llama_kv_cache_paged::find_prompt_prefix_matches(const std::vector<llama_token> & tokens) {
+    std::vector<uint32_t> bids_matches = {};
+    const auto            hashes       = compute_prompt_block_hashes(tokens, block_size);
+
+    // IMPORTANT: To avoid deadlock when prefilling matching prompts, we drop the last
+    // matched block. We are at most sending block_size - 1 recomputed positions (~1/block_size requests).
+    // Do not undo this. Keep the invariant contained in this method.
+    const size_t max_matchable_blocks = (tokens.size() % block_size == 0) ? hashes.size() - 1 : hashes.size();
+
+    for (uint32_t hash_id = 0; hash_id < max_matchable_blocks; ++hash_id) {
+        std::vector<llama_token> block_tokens(tokens.begin() + hash_id * block_size,
+                                              tokens.begin() + (hash_id + 1) * block_size);
+
+        const uint64_t bid = block_manager.lookup_block_by_hash(hashes[hash_id], block_tokens);
+        if (bid == llama_block_manager::INVALID_BLOCK_ID) {
+            break;
+        }
+        bids_matches.push_back(bid);
+    }
+    return bids_matches;
+}
+
+void llama_kv_cache_paged::claim_prompt_prefix_matches(const std::vector<uint32_t> & matches) {
+    for (const auto & bid : matches) {
+        block_manager.increment_ref(bid);
+    }
+}
+
+namespace {
+constexpr uint64_t GOLDEN_RATIO_64 = 0x9E3779B97F4A7C15ULL;
+
+inline uint64_t mix_token(uint64_t hash, llama_token tok) {
+    // Fibonacci-hash the token (similar to ngram-cache.h) and mix into hash
+    // https://probablydance.com/2018/06/16/fibonacci-hashing-the-optimization-that-the-world-forgot-or-a-better-alternative-to-integer-modulo/
+    const uint64_t tok_hash = (uint64_t) (uint32_t) tok * GOLDEN_RATIO_64;  // remember llama_token is int32_t
+    return (hash ^ tok_hash) * GOLDEN_RATIO_64;                             // XOR then, multiply
+}
+}  // namespace
+
+std::vector<uint64_t> llama_kv_cache_paged::compute_prompt_block_hashes(const std::vector<llama_token> & tokens,
+                                                                        uint32_t                         block_size) {
+    const size_t          n_full_blocks = tokens.size() / block_size;
+    std::vector<uint64_t> hashes;
+    hashes.reserve(n_full_blocks);
+
+    uint64_t hash = GOLDEN_RATIO_64;
+    for (size_t bid = 0; bid < n_full_blocks; ++bid) {
+        const size_t start = bid * block_size;
+        for (size_t tok_id = 0; tok_id < block_size; ++tok_id) {
+            hash = mix_token(hash, tokens[start + tok_id]);
+        }
+        hashes.push_back(hash);
+    }
+    return hashes;
 }
 
 // llama_memory_i
@@ -321,6 +467,56 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos /*p0*/, llama_p
     return true;
 }
 
+void llama_kv_cache_paged::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    llama_sequence_group * src_group = sequence_group_lookup(seq_id_src);
+    llama_sequence_group * dst_group = sequence_group_lookup(seq_id_dst);
+    GGML_ASSERT(src_group && "src sequence group is nullptr");
+    GGML_ASSERT(dst_group && "dst sequence group is nullptr");
+
+    // Regular refcounting + CoW is capable to do partial block sharing,
+    // but we are explicitly opting to do exclusively whole-block sharing for
+    // simplicity sake (and a bit of future-looking if when we decide to do APC).
+    const uint32_t p0_aligned = ((p0 + block_size - 1) / block_size) * block_size;
+    const uint32_t p1_aligned = (p1 / block_size) * block_size;
+    if (p0_aligned >= p1_aligned) {
+        LLAMA_LOG_DEBUG("%s: No whole-blocks to share between src (id:%d) and dst (id:%d).\n", __func__, seq_id_src,
+                        seq_id_dst);
+        return;
+    }
+
+    const size_t   src_block_table_size = src_group->block_table.size();
+    const uint32_t bid_start            = p0_aligned / block_size;
+    const uint32_t bid_end              = p1_aligned / block_size;
+    for (uint32_t bid = bid_start; bid < bid_end; ++bid) {
+        GGML_ASSERT(bid < src_block_table_size && "Attempting to copy a non-existent block (OOB).");
+
+        const size_t   dst_block_table_size = dst_group->block_table.size();
+        const uint32_t src_bid              = src_group->block_table[bid];
+        GGML_ASSERT(block_manager.is_gpu(src_bid) && "Attempting to copy a swapped block with id.");
+
+        if (bid < dst_block_table_size) {
+            const uint32_t old_dst_block_id = dst_group->block_table[bid];
+            GGML_ASSERT(block_manager.is_gpu(old_dst_block_id) && "dst must not hold swapped (CPU) blocks.");
+            block_manager.release_gpu_blocks({ old_dst_block_id });
+            dst_group->block_table[bid] = src_bid;
+        } else {
+            GGML_ASSERT(bid == dst_block_table_size && "wrong block id for the dst block table.");
+            dst_group->block_table.push_back(src_bid);
+        }
+        block_manager.increment_ref(src_bid);
+    }
+    const llama_pos curr_max = seq_pos_max(seq_id_dst);
+    const llama_pos new_max =
+        (curr_max < 0) ? (llama_pos) (p1_aligned - 1) : std::max<llama_pos>(curr_max, (llama_pos) (p1_aligned - 1));
+
+    const llama_pos curr_min = seq_pos_min(seq_id_dst);
+    const llama_pos new_min =
+        (curr_min < 0) ? (llama_pos) (p0_aligned) : std::min<llama_pos>(curr_min, (llama_pos) p0_aligned);
+
+    set_seq_max_pos(seq_id_dst, new_max);
+    set_seq_min_pos(seq_id_dst, new_min);
+}
+
 llama_pos llama_kv_cache_paged::seq_pos_min(llama_seq_id seq_id) const {
     auto it = sequence_positions.find(seq_id);
     return (it != sequence_positions.end()) ? it->second.min : -1;
@@ -355,6 +551,10 @@ void llama_kv_cache_paged::set_seq_min_pos(llama_seq_id seq_id, llama_pos new_mi
 
 void llama_kv_cache_paged::set_seq_max_pos(llama_seq_id seq_id, llama_pos new_max) {
     sequence_positions[seq_id].max = new_max;
+}
+
+llama_block_manager & llama_kv_cache_paged::get_block_manager() {
+    return block_manager;
 }
 
 // llama_kv_cache_paged_context

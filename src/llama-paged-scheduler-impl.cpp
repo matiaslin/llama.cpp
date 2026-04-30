@@ -9,7 +9,10 @@ llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_
     n_seq_max_ctx(n_ctx),
     block_size(block_sz),
     n_batch(n_batch),
-    kv_cache_manager(kv_manager) {}
+    kv_cache_manager(kv_manager) {
+    GGML_ASSERT(kv_manager && "scheduler must be initialized with a valid llama_kv_cache_paged.");
+    kv_cache_manager->set_sequence_group_lookup([this](int32_t id) { return get_group_from_id(id); });
+}
 
 bool llama_paged_scheduler_impl::check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const {
     if (n_candidates == 0 && (n_swapped > 0 || n_waiting > 0)) {
@@ -145,7 +148,7 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
 }
 
 // Try to swap a running sequence out to CPU.
-// if the CPU pool is full, fall back to recomputation by resetting the sequence's decode state
+// If the CPU pool is full, fall back to recomputation by resetting the sequence's decode state
 // and sending it back to the waiting queue.
 //
 // Takes ownership of group_ptr.
@@ -212,7 +215,7 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
         if (required_capacity >= current_capacity) {
             LLAMA_LOG_DEBUG("%s: (running_pending) request_id=%d: requires a new block to decode.\n", __func__,
                             group->request_id);
-            bool success = kv_cache_manager->allocate(1, *group);  // decode phase
+            bool success = kv_cache_manager->allocate(group->n_past + 1, *group);  // decode phase
             if (!success) {
                 if (running.size() > 1) {
                     const bool curr_is_back = (std::next(it) == running.end());
@@ -227,7 +230,7 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
                     }
 
                     // Try allocating again after eviction
-                    success = kv_cache_manager->allocate(1, *group);
+                    success = kv_cache_manager->allocate(group->n_past + 1, *group);
                 }
 
                 if (!success) {
@@ -241,6 +244,14 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
             }
             LLAMA_LOG_DEBUG("%s: (running_restored) request_id=%d: found a new block to continue decoding.\n", __func__,
                             group->request_id);
+        }
+
+        if (!kv_cache_manager->try_cow_shared_blocks(*group, (int32_t) group->n_past, /*n_write_tokens=*/1)) {
+            // CoW prevented due to insufficient GPU budget
+            llama_sequence_group_ptr self = std::move(*it);
+            it                            = running.erase(it);
+            swap_out_or_recompute(std::move(self));
+            continue;
         }
 
         // A request is a candidate if we there is still room for generation without adding blocks
@@ -278,24 +289,39 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         llama_sequence_group * group = it->get();
         GGML_ASSERT(group && "the waiting group is nullptr.");
 
-        const int32_t tokens_needed = group->n_prompt + 1;
-        if (tokens_needed > remaining_token_budget) {
+        // Discovering prefix matches
+        const auto     matched_bids   = kv_cache_manager->find_prompt_prefix_matches(group->logical_seq);
+        const uint32_t matched_tokens = matched_bids.size() * (int32_t) block_size;
+        GGML_ASSERT(matched_tokens <= group->n_prompt &&
+                    "number of matched prompt tokens exceeds the number of prompt tokens.");
+
+        group->n_past                = matched_tokens;
+        const uint32_t tokens_needed = group->n_prompt - matched_tokens + 1;
+        if ((int32_t) tokens_needed > remaining_token_budget) {
             break;
         }
 
-        ++count;
-        // When prefilling, we want to always guarantee at least one decode to avoid thrashing
-        const bool success = kv_cache_manager->allocate(tokens_needed, *group);
+        // Assign block tables (soft commitment, rollback if allocate fails).
+        group->block_table = matched_bids;
+
+        // When prefilling, we alwways want to guarantee at least one decode to avoid thrashing
+        const bool success = kv_cache_manager->allocate(group->n_prompt + 1, *group);
         if (!success) {
+            // Rollback the prefix matching (if any)
+            group->block_table.clear();
             // We respect FCFS, so we stop here to prevent a younger waiting request from jumping ahead.
             break;
         }
+
+        // Commiting to prefix-sharing (increment ref_counts)
+        kv_cache_manager->claim_prompt_prefix_matches(matched_bids);
         candidates.push_back(group);
         remaining_token_budget -= tokens_needed;
         llama_sequence_group_ptr group_ptr = std::move(*it);
         LLAMA_LOG_DEBUG("%s: (start) request_id=%d sent for processing.\n", __func__, group_ptr->request_id);
         set_running(std::move(group_ptr));
         it = waiting.erase(it);
+        ++count;
     }
     if (count > 0) {
         LLAMA_LOG_DEBUG("%s: Started %ld waiting requests\n", __func__, count);
@@ -363,7 +389,7 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
     // Calculating required sizes
     for (const auto & group : candidates) {
         GGML_ASSERT(group && "candidate request is nullptr.");
-        total_tokens += (group->n_decoded > 0) ? 1 : group->n_prompt;
+        total_tokens += (group->n_decoded > 0) ? 1 : (group->n_prompt - group->n_past);
         max_blocks = std::max(max_blocks, (int32_t) group->block_table.size());
     }
 
@@ -392,8 +418,9 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
         llama_sequence_group * group = candidates[seq_id];
         GGML_ASSERT(group && "Make sure the candidates are not nullptr.");
 
-        const bool    is_prefill = group->n_decoded == 0;
-        const int32_t new_tokens = is_prefill ? group->n_prompt : 1;
+        const bool    is_prefill    = group->n_decoded == 0;
+        const int32_t prefill_start = is_prefill ? group->n_past : 0;  // n_past can be 0 or not (prefix-sharing)
+        const int32_t new_tokens    = is_prefill ? (group->n_prompt - prefill_start) : 1;
 
         if (is_prefill) {
             GGML_ASSERT(group->logical_seq.size() >= (size_t) new_tokens && "logical_seq too small for prefill");
@@ -404,8 +431,9 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
         for (int token_idx = 0; token_idx < new_tokens; ++token_idx) {
             int32_t batch_start_id = token_offset + token_idx;
 
-            batch.token[batch_start_id] = is_prefill ? group->logical_seq[token_idx] : group->logical_seq.back();
-            batch.pos[batch_start_id]   = group->n_past + token_idx;  // n_past starts at 0
+            batch.token[batch_start_id] =
+                is_prefill ? group->logical_seq[prefill_start + token_idx] : group->logical_seq.back();
+            batch.pos[batch_start_id] = group->n_past + token_idx;  // n_past starts at 0
 
             batch.n_seq_id[batch_start_id]  = 1;
             batch.seq_id[batch_start_id][0] = group->request_id;
@@ -454,7 +482,8 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         GGML_ASSERT(group && "group is nullptr.");
 
         // TTFT
-        if (group->n_decoded == 0) {
+        const bool was_prefill = (group->n_decoded == 0);
+        if (was_prefill) {
             group->t_first_token_us = ggml_time_us();
         }
 
@@ -465,6 +494,10 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         }
         int32_t last_token_in_batch_idx = token_offset + curr_info.batch_lens[i] - 1;
         kv_cache_manager->set_seq_max_pos(group->request_id, batch.pos[last_token_in_batch_idx]);
+
+        if (was_prefill) {
+            kv_cache_manager->register_prompt_blocks(*group);
+        }
 
         group->n_past += curr_info.batch_lens[i];
         group->n_decoded += curr_info.batch_lens[i];

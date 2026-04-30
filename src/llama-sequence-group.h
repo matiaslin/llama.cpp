@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <vector>
@@ -31,3 +32,4 @@ struct llama_sequence_group {
 using llama_sequence_group_raw_list = std::vector<llama_sequence_group *>;
 using llama_sequence_group_ptr      = std::unique_ptr<llama_sequence_group>;
 using llama_sequence_group_list     = std::list<llama_sequence_group_ptr>;
+using llama_sequence_group_cb       = std::function<llama_sequence_group *(int32_t)>;

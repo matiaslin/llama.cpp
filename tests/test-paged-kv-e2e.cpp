@@ -187,6 +187,134 @@ static path_result run_paged(const std::string & model_path) {
     return result;
 }
 
+// Two-request paged run where B is queued only after A has prefilled and
+// registered its prompt blocks. B then claims A's prompt blocks via the
+// prefix-sharing path and serves only the unshared tail through the model.
+struct paired_paged_result {
+    path_result a_res;
+    path_result b_res;
+    bool        prefix_shared      = false;  // sanity: B was admitted with a non-empty match
+    int32_t     b_first_batch_lens = -1;     // B's batch_lens on its prefill step
+    int32_t     b_first_n_past     = -1;     // B's n_past at first appearance
+    size_t      n_prompt_tokens    = 0;
+};
+
+static paired_paged_result run_paged_with_shared_prefix(const std::string & model_path) {
+    common_params params;
+    params.model.path    = model_path;
+    params.n_ctx         = 256;
+    params.n_batch       = 64;
+    params.n_ubatch      = 64;
+    params.n_predict     = N_PREDICT;
+    params.sampling.temp = 0.0f;
+    params.warmup        = false;
+    params.kv_paged      = true;
+    params.block_size    = 4;  // small block to ensure the short test prompt covers > 1 full block
+    params.n_gpu_blocks  = 64;
+    params.n_cpu_blocks  = 16;
+    params.n_sequences   = 2;
+    params.n_parallel    = 2;
+
+    auto            init  = common_init_from_params(params);
+    llama_model *   model = init->model();
+    llama_context * ctx   = init->context();
+    EXPECT_TRUE(model != nullptr);
+    EXPECT_TRUE(ctx != nullptr);
+
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int           n_vocab = llama_vocab_n_tokens(vocab);
+
+    llama_paged_scheduler * sched = llama_paged_scheduler_init(ctx);
+    EXPECT_TRUE(sched != nullptr);
+
+    std::vector<llama_token> prompt_tokens = common_tokenize(ctx, TEST_PROMPT, true);
+    EXPECT_TRUE(!prompt_tokens.empty());
+    EXPECT_TRUE(prompt_tokens.size() >= (size_t) (params.block_size * 2));
+
+    EXPECT_TRUE(llama_paged_scheduler_add_request(sched, prompt_tokens.data(), prompt_tokens.size(), 0));
+
+    common_sampler * smpl_a = common_sampler_init(model, params.sampling);
+    common_sampler * smpl_b = common_sampler_init(model, params.sampling);
+    EXPECT_TRUE(smpl_a != nullptr && smpl_b != nullptr);
+
+    paired_paged_result out;
+    out.a_res.n_vocab   = n_vocab;
+    out.b_res.n_vocab   = n_vocab;
+    out.n_prompt_tokens = prompt_tokens.size();
+
+    bool        b_queued           = false;
+    bool        captured_a_prefill = false;
+    bool        captured_b_prefill = false;
+    llama_batch batch              = {};
+
+    while ((int) out.a_res.tokens.size() < N_PREDICT || (int) out.b_res.tokens.size() < N_PREDICT) {
+        // Queue B only after A's first prefill has run, so A's prompt blocks
+        // are registered and findable via the prefix-match path.
+        if (!b_queued && captured_a_prefill) {
+            EXPECT_TRUE(llama_paged_scheduler_add_request(sched, prompt_tokens.data(), prompt_tokens.size(), 1));
+            b_queued = true;
+        }
+
+        bool prepared = llama_paged_scheduler_prepare_batch(sched, &batch);
+        EXPECT_TRUE(prepared);
+        if (batch.n_tokens == 0) {
+            break;
+        }
+
+        EXPECT_TRUE(llama_decode(ctx, batch) == 0);
+        llama_synchronize(ctx);
+
+        const llama_paged_batch_info * info = llama_paged_scheduler_get_batch_info(sched);
+        EXPECT_TRUE(info != nullptr);
+
+        std::vector<llama_token> sampled(info->n_seq, 0);
+        std::vector<int8_t>      stop_flags(info->n_seq, 0);
+
+        for (int sid = 0; sid < info->n_seq; ++sid) {
+            const int32_t off      = info->batch_offsets[sid];
+            const int32_t len      = info->batch_lens[sid];
+            const int32_t last_idx = off + len - 1;
+            const int32_t req_id   = batch.seq_id[off][0];
+
+            const float * raw = llama_get_logits_ith(ctx, last_idx);
+            EXPECT_TRUE(raw != nullptr);
+
+            path_result &    dst      = (req_id == 0) ? out.a_res : out.b_res;
+            common_sampler * smp      = (req_id == 0) ? smpl_a : smpl_b;
+            bool &           captured = (req_id == 0) ? captured_a_prefill : captured_b_prefill;
+
+            if (!captured) {
+                dst.prefill_logits.assign(raw, raw + n_vocab);
+                captured = true;
+                if (req_id == 1) {
+                    out.b_first_batch_lens = len;
+                    // n_past at the start of this step (populate_batch_from set pos values)
+                    out.b_first_n_past     = batch.pos[off];
+                    out.prefix_shared      = (len < (int32_t) prompt_tokens.size());
+                }
+            }
+
+            if ((int) dst.tokens.size() < N_PREDICT) {
+                llama_token next = common_sampler_sample(smp, ctx, last_idx);
+                common_sampler_accept(smp, next, true);
+                dst.tokens.push_back(next);
+                sampled[sid]    = next;
+                bool stop       = llama_vocab_is_eog(vocab, next) || (int) dst.tokens.size() >= N_PREDICT;
+                stop_flags[sid] = stop ? 1 : 0;
+            } else {
+                stop_flags[sid] = 1;
+            }
+        }
+
+        llama_paged_scheduler_update(sched, &batch, sampled.data(), stop_flags.data());
+    }
+
+    common_sampler_free(smpl_a);
+    common_sampler_free(smpl_b);
+    llama_paged_scheduler_free(sched);
+    return out;
+}
+
 static void compare_results(const path_result & ref, const path_result & paged) {
     auto top_k = [](const std::vector<float> & l, int k) {
         std::vector<int> idx(l.size());
@@ -273,6 +401,21 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  got %zu tokens, %d-vocab logits\n", paged.tokens.size(), paged.n_vocab);
 
     compare_results(ref, paged);
+
+    fprintf(stderr, "test-paged-kv-e2e: running paged path with shared prefix (B claims A's blocks)\n");
+    paired_paged_result shared = run_paged_with_shared_prefix(params.model.path);
+    fprintf(stderr, "  prompt tokens: %zu, B first batch_lens: %d, B first n_past: %d, prefix_shared=%d\n",
+            shared.n_prompt_tokens, shared.b_first_batch_lens, shared.b_first_n_past, shared.prefix_shared ? 1 : 0);
+
+    EXPECT_TRUE(shared.prefix_shared);
+    EXPECT_TRUE(shared.b_first_n_past > 0);
+    EXPECT_TRUE(shared.b_first_batch_lens >= 1);
+    EXPECT_TRUE((size_t) (shared.b_first_n_past + shared.b_first_batch_lens) == shared.n_prompt_tokens);
+
+    fprintf(stderr, "test-paged-kv-e2e: comparing A (paged, no prefix share) vs reference\n");
+    compare_results(ref, shared.a_res);
+    fprintf(stderr, "test-paged-kv-e2e: comparing B (paged, served via shared prefix) vs reference\n");
+    compare_results(ref, shared.b_res);
 
     llama_backend_free();
     return 0;

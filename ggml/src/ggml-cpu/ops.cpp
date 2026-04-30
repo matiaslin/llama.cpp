@@ -11254,14 +11254,23 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     GGML_ASSERT(n_heads_kv != 0 && "n_head_kv cannot be 0.");
     GGML_ASSERT(n_heads % n_heads_kv == 0 && "n_heads must be divisible by n_head_kv.");
 
-    const size_t stride_token = kv_cache->nb[1] / sizeof(ggml_fp16_t);
-    const size_t stride_head  = kv_cache->nb[2] / sizeof(ggml_fp16_t);
-    const size_t stride_block = kv_cache->nb[3] / sizeof(ggml_fp16_t);
+    const size_t cache_stride_token = kv_cache->nb[1] / sizeof(ggml_fp16_t);
+    const size_t cache_stride_head  = kv_cache->nb[2] / sizeof(ggml_fp16_t);
+    const size_t cache_stride_block = kv_cache->nb[3] / sizeof(ggml_fp16_t);
 
-    // Accessing tensors via backend API to make the CPU reference implementation backend agnostic
-    std::vector<float>   q_host(ggml_nelements(q));
-    std::vector<float>   k_host(ggml_nelements(k_new));
-    std::vector<float>   v_host(ggml_nelements(v_new));
+    // Input strides honor source layout
+    const size_t q_input_stride_token = q->nb[2] / sizeof(float);
+    const size_t q_input_stride_head  = q->nb[1] / sizeof(float);
+    const size_t k_input_stride_token = k_new->nb[2] / sizeof(float);
+    const size_t k_input_stride_head  = k_new->nb[1] / sizeof(float);
+    const size_t v_input_stride_token = v_new->nb[2] / sizeof(float);
+    const size_t v_input_stride_head  = v_new->nb[1] / sizeof(float);
+
+    // Size host buffers by ggml_nbytes since views into fused tensors span more memory than the
+    // logical element count would suggest (strides reach into sibling regions of the parent tensor).
+    std::vector<float>   q_host(ggml_nbytes(q) / sizeof(float));
+    std::vector<float>   k_host(ggml_nbytes(k_new) / sizeof(float));
+    std::vector<float>   v_host(ggml_nbytes(v_new) / sizeof(float));
     std::vector<int32_t> block_table_host(ggml_nelements(block_table));
     std::vector<int32_t> slots_host(ggml_nelements(write_slots));
     std::vector<int32_t> ctx_lens_host(ggml_nelements(ctx_lens));
@@ -11269,14 +11278,14 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     std::vector<int32_t> batch_lens_host(ggml_nelements(batch_lens));
     std::vector<float>   out_host(ggml_nelements(dst));
 
-    ggml_backend_tensor_get(q,             q_host.data(),             0, ggml_nbytes(q));
-    ggml_backend_tensor_get(k_new,         k_host.data(),             0, ggml_nbytes(k_new));
-    ggml_backend_tensor_get(v_new,         v_host.data(),             0, ggml_nbytes(v_new));
-    ggml_backend_tensor_get(block_table,   block_table_host.data(),   0, ggml_nbytes(block_table));
-    ggml_backend_tensor_get(write_slots,   slots_host.data(),         0, ggml_nbytes(write_slots));
-    ggml_backend_tensor_get(ctx_lens,      ctx_lens_host.data(),      0, ggml_nbytes(ctx_lens));
+    ggml_backend_tensor_get(q, q_host.data(), 0, ggml_nbytes(q));
+    ggml_backend_tensor_get(k_new, k_host.data(), 0, ggml_nbytes(k_new));
+    ggml_backend_tensor_get(v_new, v_host.data(), 0, ggml_nbytes(v_new));
+    ggml_backend_tensor_get(block_table, block_table_host.data(), 0, ggml_nbytes(block_table));
+    ggml_backend_tensor_get(write_slots, slots_host.data(), 0, ggml_nbytes(write_slots));
+    ggml_backend_tensor_get(ctx_lens, ctx_lens_host.data(), 0, ggml_nbytes(ctx_lens));
     ggml_backend_tensor_get(batch_offsets, batch_offsets_host.data(), 0, ggml_nbytes(batch_offsets));
-    ggml_backend_tensor_get(batch_lens,    batch_lens_host.data(),    0, ggml_nbytes(batch_lens));
+    ggml_backend_tensor_get(batch_lens, batch_lens_host.data(), 0, ggml_nbytes(batch_lens));
 
     const float *   q_data             = q_host.data();
     const float *   k_data             = k_host.data();
@@ -11286,7 +11295,7 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     const int32_t * ctx_lens_data      = ctx_lens_host.data();
     const int32_t * batch_offsets_data = batch_offsets_host.data();
     const int32_t * batch_lens_data    = batch_lens_host.data();
-    float * out_data = out_host.data(); // use host buffer throughout
+    float *         out_data           = out_host.data();  // use host buffer throughout
 
     // We use staging buffers for KV cache access to make it agnostic to where
     // the KV cache is allocated.
@@ -11308,18 +11317,23 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
             const int token_in_block  = target_slot % block_size;
 
             for (int h_id = 0; h_id < n_heads_kv; ++h_id) {
-                const size_t k_cache_byte_offset = ((size_t) block_id * stride_block + (size_t) h_id * stride_head +
-                                                    (size_t) token_in_block * stride_token) *
-                                                   sizeof(ggml_fp16_t);
-                const size_t v_cache_byte_offset =
-                    ((size_t) block_id * stride_block + (size_t) (n_heads_kv + h_id) * stride_head +
-                     (size_t) token_in_block * stride_token) *
+                const size_t k_cache_byte_offset =
+                    ((size_t) block_id * cache_stride_block + (size_t) h_id * cache_stride_head +
+                     (size_t) token_in_block * cache_stride_token) *
                     sizeof(ggml_fp16_t);
-                const size_t input_offset = (size_t) token_batch_idx * n_heads_kv * head_dim + (size_t) h_id * head_dim;
+                const size_t v_cache_byte_offset =
+                    ((size_t) block_id * cache_stride_block + (size_t) (n_heads_kv + h_id) * cache_stride_head +
+                     (size_t) token_in_block * cache_stride_token) *
+                    sizeof(ggml_fp16_t);
+
+                const size_t k_input_offset =
+                    (size_t) token_batch_idx * k_input_stride_token + (size_t) h_id * k_input_stride_head;
+                const size_t v_input_offset =
+                    (size_t) token_batch_idx * v_input_stride_token + (size_t) h_id * v_input_stride_head;
 
                 for (int d_id = 0; d_id < head_dim; ++d_id) {
-                    staging_write_k[d_id] = GGML_FP32_TO_FP16(k_data[input_offset + d_id]);
-                    staging_write_v[d_id] = GGML_FP32_TO_FP16(v_data[input_offset + d_id]);
+                    staging_write_k[d_id] = GGML_FP32_TO_FP16(k_data[k_input_offset + d_id]);
+                    staging_write_v[d_id] = GGML_FP32_TO_FP16(v_data[v_input_offset + d_id]);
                 }
                 ggml_backend_tensor_set((ggml_tensor *) kv_cache_mut, staging_write_k.data(), k_cache_byte_offset,
                                         head_bytes);
@@ -11343,7 +11357,8 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
             for (int h_id = 0; h_id < n_heads; ++h_id) {
                 const int kv_h = h_id / (n_heads / n_heads_kv);
 
-                const float * q_vec = q_data + token_batch_idx * n_heads * head_dim + h_id * head_dim;
+                const float * q_vec =
+                    q_data + (size_t) token_batch_idx * q_input_stride_token + (size_t) h_id * q_input_stride_head;
 
                 float              qk_max  = -FLT_MAX;
                 float              exp_sum = 0.0f;
@@ -11359,13 +11374,13 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
                     for (int tok = start_token; tok < end_token; ++tok) {
                         const int    token_in_block = tok % block_size;
                         const size_t k_byte_offset =
-                            ((size_t) physical_block * stride_block + (size_t) kv_h * stride_head +
-                             (size_t) token_in_block * stride_token) *
+                            ((size_t) physical_block * cache_stride_block + (size_t) kv_h * cache_stride_head +
+                             (size_t) token_in_block * cache_stride_token) *
                             sizeof(ggml_fp16_t);
-                        const size_t v_byte_offset =
-                            ((size_t) physical_block * stride_block + (size_t) (n_heads_kv + kv_h) * stride_head +
-                             (size_t) token_in_block * stride_token) *
-                            sizeof(ggml_fp16_t);
+                        const size_t v_byte_offset = ((size_t) physical_block * cache_stride_block +
+                                                      (size_t) (n_heads_kv + kv_h) * cache_stride_head +
+                                                      (size_t) token_in_block * cache_stride_token) *
+                                                     sizeof(ggml_fp16_t);
 
                         // Fetch K and V from cache (this might involve device to host transfers)
                         ggml_backend_tensor_get(kv_cache, staging_k.data(), k_byte_offset, head_bytes);

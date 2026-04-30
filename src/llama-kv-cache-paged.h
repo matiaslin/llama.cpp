@@ -28,13 +28,27 @@ class llama_kv_cache_paged : public llama_memory_i {
               uint32_t       n_cpu_blocks,
               float          watermark);  // percentage
 
-    bool allocate(int32_t num_tokens, llama_sequence_group & group);
+    bool allocate(uint32_t num_tokens, llama_sequence_group & group);
     void free_blocks(llama_sequence_group & group);
     bool swap_in(llama_sequence_group & group);
     bool swap_out(llama_sequence_group & group);
 
+    bool try_cow_shared_blocks(llama_sequence_group & group, int32_t write_start_pos, int32_t n_write_tokens);
+
+    void     set_sequence_group_lookup(llama_sequence_group_cb cb);
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;
+
+    // Registers cumulative-hash to block_id entries for the full prompt blocks of `group`.
+    // Call once per sequence after its prefill batch executes.
+    // Idempotent: already-registered blocks (e.g. borrowed via prefix match) are no-ops.
+    // Trailing partial prompt block is excluded (only whole blocks are eligible).
+    void                  register_prompt_blocks(const llama_sequence_group & group);
+    std::vector<uint32_t> find_prompt_prefix_matches(const std::vector<llama_token> & tokens);
+    void                  claim_prompt_prefix_matches(const std::vector<uint32_t> & matches);
+
+    static std::vector<uint64_t> compute_prompt_block_hashes(const std::vector<llama_token> & tokens,
+                                                             uint32_t                         block_size);
 
     //
     // llama_memory_i
@@ -52,11 +66,7 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
-    void seq_cp(llama_seq_id /*seq_id_src*/,
-                llama_seq_id /*seq_id_dst*/,
-                llama_pos /*p0*/,
-                llama_pos /*p1*/) override { /* implement later CoW mechanism */
-    }
+    void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
 
     void seq_keep(llama_seq_id /*seq_id*/) override {}
 
@@ -84,9 +94,13 @@ class llama_kv_cache_paged : public llama_memory_i {
     void set_seq_min_pos(llama_seq_id seq_id, llama_pos new_min);
     void set_seq_max_pos(llama_seq_id seq_id, llama_pos new_max);
 
+    // Internal (debug + testing)
+    llama_block_manager & get_block_manager();
+
   private:
     void concat_block_ids(llama_block_ids & to_block_table, const llama_block_ids & from_block_table);
     void do_block_copy(const llama_block_ids & src_ids, const llama_block_ids & new_ids, bool to_gpu);
+    void do_block_copy_gpu_to_gpu(uint32_t src_bid, uint32_t dst_bid);
 
     // Master physical buffer
     // For CUDA: memory is interleaved
@@ -124,6 +138,7 @@ class llama_kv_cache_paged : public llama_memory_i {
     };
 
     std::unordered_map<llama_seq_id, seq_range> sequence_positions;
+    llama_sequence_group_cb                     sequence_group_lookup;
 };
 
 class llama_kv_cache_paged_context : public llama_memory_context_i {

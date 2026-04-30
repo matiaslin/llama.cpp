@@ -1972,15 +1972,6 @@ ggml_tensor * llm_graph_context::build_attn_mha_paged(
                float   kq_scale,
                  int   block_size,
                  int   max_blocks) const {
-
-    // Paged attention kernel (write) assumes dense layout [n_tokens. n_heads_kv, head_dim].
-    // Architectures like (Falcon, GPT-2, etc.) produce KV as views into a fused QKV tensor
-    // We force contiguity before passing to kernel.
-    // This can be optimized in phase 2.
-    k_cur = ggml_cont(ctx0, k_cur);
-    v_cur = ggml_cont(ctx0, v_cur);
-    q     = ggml_cont(ctx0, q);
-
     ggml_tensor * cur = ggml_paged_attn(ctx0,
                                         q, k_cur, v_cur, k_cache, v_cache,
                                         block_table, write_slots, context_lens, batch_offsets, batch_lens,

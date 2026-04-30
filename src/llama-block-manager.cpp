@@ -89,6 +89,13 @@ void llama_block_manager::release_gpu_blocks(const PhysicalBlockIds & freed_bloc
         gpu_registry[id].ref_count -= 1;
         if (gpu_registry[id].ref_count <= 0) {
             gpu_registry[id].ref_count = 0;
+
+            // Drop hash registration before returning the block to the free pool
+            auto meta_it = block_to_meta.find(id);
+            if (meta_it != block_to_meta.end()) {
+                hash_to_block.erase(meta_it->second.hash);
+                block_to_meta.erase(meta_it);
+            }
             free_gpu_ids.push_back(id);
         }
     }
@@ -104,6 +111,49 @@ void llama_block_manager::release_cpu_blocks(const PhysicalBlockIds & freed_bloc
     }
 }
 
+void llama_block_manager::increment_ref(uint32_t block_id) {
+    // Only increment checked-out GPU blocks
+    GGML_ASSERT(!gpu_registry.empty() && "gpu_registry is empty.");
+    GGML_ASSERT(block_id < total_num_gpu_blocks && "increment ref only supported for GPU blocks.");
+    GGML_ASSERT(gpu_registry[block_id].ref_count > 0 && "can only increment checked-out GPU blocks.");
+    gpu_registry[block_id].ref_count += 1;
+}
+
+uint32_t llama_block_manager::get_ref_count(uint32_t block_id) const {
+    GGML_ASSERT(!gpu_registry.empty() && "gpu_registry is empty.");
+    GGML_ASSERT(block_id < total_num_gpu_blocks && "get ref count only supported for GPU blocks.");
+    return gpu_registry[block_id].ref_count;
+}
+
 bool llama_block_manager::is_gpu(uint32_t block_id) const {
     return block_id < total_num_gpu_blocks;
+}
+
+void llama_block_manager::register_block_hash(uint32_t block_id, uint64_t hash, TokenList tokens) {
+    GGML_ASSERT(block_id < total_num_gpu_blocks && "hash registration only supported for GPU blocks.");
+    GGML_ASSERT(gpu_registry[block_id].ref_count > 0 && "cannot register a freed block.");
+
+    if (hash_to_block.count(hash)) {
+        // Hash already registered (either the same block or a collision).
+        // First write wins, so no-op.
+        return;
+    }
+
+    hash_to_block[hash]     = block_id;
+    block_to_meta[block_id] = { hash, std::move(tokens) };
+}
+
+uint32_t llama_block_manager::lookup_block_by_hash(uint64_t hash, const TokenList & tokens) const {
+    auto it = hash_to_block.find(hash);
+    if (it == hash_to_block.end()) {
+        return INVALID_BLOCK_ID;
+    }
+    const uint32_t bid     = it->second;
+    auto           meta_it = block_to_meta.find(bid);
+    GGML_ASSERT(meta_it != block_to_meta.end() && "hash_to_block & block_to_meta out of sync.");
+
+    if (meta_it->second.tokens != tokens) {
+        return INVALID_BLOCK_ID;  // hash collision with different tokens
+    }
+    return bid;
 }

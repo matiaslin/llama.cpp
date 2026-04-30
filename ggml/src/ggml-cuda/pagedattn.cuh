@@ -1,16 +1,21 @@
 #include "common.cuh"
 
-__global__ void paged_attention_write_kernel(const float * k_new,        // [batch_size, n_heads_kv, head_dim]
-                                             const float * v_new,        // [batch_size, n_heads_kv, head_dim]
-                                             half *        kv_cache,     // The paged cache
-                                             const int *   write_slots,  // Global slot index for each token
-                                             const int *   batch_offsets,
-                                             const int *   batch_lens,
-                                             const size_t  stride_token,  // Elements between tokens in a block (nb1)
-                                             const size_t  stride_head,   // Elements between heads (nb2)
-                                             const size_t  stride_block,  // Elements between physical blocks (nb3)
-                                             const int     n_heads_kv,
-                                             const int     block_size);
+__global__ void paged_attention_write_kernel(
+    const float * k_new,        // [head_dim, n_heads_kv, batch_size]
+    const float * v_new,        // [head_dim, n_heads_kv, batch_size]
+    half *        kv_cache,     // The paged cache
+    const int *   write_slots,  // Global slot index for each token
+    const int *   batch_offsets,
+    const int *   batch_lens,
+    const size_t  cache_stride_token,    // KV cache: elements between tokens in a block
+    const size_t  cache_stride_head,     // KV cache: elements between heads
+    const size_t  cache_stride_block,    // KV cache: elements between physical blocks
+    const size_t  k_input_stride_token,  // K input: elements between tokens
+    const size_t  k_input_stride_head,   // K input: elements between heads
+    const size_t  v_input_stride_token,  // V input: elements between tokens
+    const size_t  v_input_stride_head,   // V input: elements between heads
+    const int     n_heads_kv,
+    const int     block_size);
 
 __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
                                               const half * __restrict__ kv_cache,
@@ -18,9 +23,11 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
                                               const int * __restrict__ context_lens,
                                               const int * __restrict__ batch_offsets,
                                               const int * __restrict__ batch_lens,
-                                              const size_t stride_token,
-                                              const size_t stride_head,
-                                              const size_t stride_block,
+                                              const size_t cache_stride_token,
+                                              const size_t cache_stride_head,
+                                              const size_t cache_stride_block,
+                                              const size_t q_input_stride_token,
+                                              const size_t q_input_stride_head,
                                               const int    n_heads_kv,
                                               const int    block_size,
                                               const int    max_blocks,
